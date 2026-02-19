@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -43,7 +44,7 @@ var payloadDefinition = agentstructs.PayloadType{
 	CanBeWrappedByTheFollowingPayloadTypes: []string{},
 	SupportsDynamicLoading:                 false,
 	Description:                            fmt.Sprintf("A fully featured macOS and Linux Golang agent.\nNeeds Mythic 3.3.0+\nNOTE: P2P not compatible with v2.1 agents!"),
-	SupportedC2Profiles:                    []string{"http", "websocket", "tcp", "dynamichttp", "webshell", "httpx", "dns"},
+	SupportedC2Profiles:                    []string{"http", "websocket", "tcp", "dynamichttp", "webshell", "httpx", "dns", "turnc2"},
 	MythicEncryptsData:                     true,
 	BuildParameters: []agentstructs.BuildParameter{
 		{
@@ -94,7 +95,7 @@ var payloadDefinition = agentstructs.PayloadType{
 			Description:   "Prioritize the order in which egress connections are made (if including multiple egress c2 profiles)",
 			Required:      false,
 			ParameterType: agentstructs.BUILD_PARAMETER_TYPE_ARRAY,
-			DefaultValue:  []string{"http", "websocket", "dynamichttp", "httpx"},
+			DefaultValue:  []string{"http", "websocket", "dynamichttp", "httpx", "turnc2"},
 			GroupName:     "egress",
 			UiPosition:    6,
 		},
@@ -167,7 +168,7 @@ var payloadDefinition = agentstructs.PayloadType{
 			}
 			atLeastOneCallbackWithinRange := false
 			for activeC2, _ := range sleepInfo {
-				if activeC2 == "websocket" && callback.LastCheckin.Unix() == 0 {
+				if (activeC2 == "websocket" || activeC2 == "turnc2") && callback.LastCheckin.Unix() == 0 {
 					atLeastOneCallbackWithinRange = true
 					continue
 				}
@@ -393,6 +394,21 @@ func build(payloadBuildMsg agentstructs.PayloadBuildMessage) agentstructs.Payloa
 					initialConfig[key] = val
 				}
 
+			}
+		}
+		// Auto-fetch SDP offer for turnc2 if not provided
+		if payloadBuildMsg.C2Profiles[index].Name == "turnc2" {
+			sdpOffer, _ := initialConfig["sdp_offer"].(string)
+			if sdpOffer == "" {
+				offerID, encodedOffer, fetchErr := fetchTurnc2Offer()
+				if fetchErr != nil {
+					payloadBuildResponse.Success = false
+					payloadBuildResponse.BuildStdErr = fmt.Sprintf("Failed to auto-fetch turnc2 SDP offer: %v", fetchErr)
+					return payloadBuildResponse
+				}
+				initialConfig["sdp_offer"] = encodedOffer
+				initialConfig["offer_id"] = offerID
+				payloadBuildResponse.BuildStdOut += fmt.Sprintf("[turnc2] Auto-fetched SDP offer (ID: %s)\n", offerID)
 			}
 		}
 		initialConfigBytes, err := json.Marshal(initialConfig)
@@ -670,6 +686,50 @@ func onNewCallback(data agentstructs.PTOnNewCallbackAllData) agentstructs.PTOnNe
 		Error:           "",
 	}
 }
+// fetchTurnc2Offer fetches a fresh SDP offer from the turnc2 admin endpoint.
+// It first tries POST to http://127.0.0.1:8733/admin/offers to generate a new offer.
+// If that fails, it falls back to reading offers.json from the c2_code directory.
+func fetchTurnc2Offer() (string, string, error) {
+	type offerResponse struct {
+		OfferID      string `json:"offer_id"`
+		EncodedOffer string `json:"encoded_offer"`
+	}
+
+	// Try the admin API first
+	resp, err := http.Post("http://127.0.0.1:8733/admin/offers", "application/json", nil)
+	if err == nil {
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			body, err := io.ReadAll(resp.Body)
+			if err == nil {
+				var offer offerResponse
+				if err := json.Unmarshal(body, &offer); err == nil && offer.OfferID != "" && offer.EncodedOffer != "" {
+					return offer.OfferID, offer.EncodedOffer, nil
+				}
+			}
+		}
+	}
+
+	// Fallback: read offers.json
+	offersPath := filepath.Join(".", "c2", "c2_code", "offers.json")
+	offersData, err := os.ReadFile(offersPath)
+	if err != nil {
+		return "", "", fmt.Errorf("admin API unavailable and failed to read offers.json: %v", err)
+	}
+
+	var offers []offerResponse
+	if err := json.Unmarshal(offersData, &offers); err != nil {
+		return "", "", fmt.Errorf("failed to parse offers.json: %v", err)
+	}
+
+	if len(offers) == 0 {
+		return "", "", fmt.Errorf("no offers available in offers.json")
+	}
+
+	// Use the first available offer
+	return offers[0].OfferID, offers[0].EncodedOffer, nil
+}
+
 func Initialize() {
 	agentstructs.AllPayloadData.Get("poseidon").AddPayloadDefinition(payloadDefinition)
 	agentstructs.AllPayloadData.Get("poseidon").AddBuildFunction(build)
