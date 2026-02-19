@@ -407,7 +407,6 @@ func build(payloadBuildMsg agentstructs.PayloadBuildMessage) agentstructs.Payloa
 					return payloadBuildResponse
 				}
 				initialConfig["sdp_offer"] = encodedOffer
-				initialConfig["offer_id"] = offerID
 				payloadBuildResponse.BuildStdOut += fmt.Sprintf("[turnc2] Auto-fetched SDP offer (ID: %s)\n", offerID)
 			}
 		}
