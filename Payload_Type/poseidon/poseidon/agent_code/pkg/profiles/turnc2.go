@@ -402,6 +402,8 @@ func (c *C2Turnc2) establishWebRTC() error {
 	settingEngine := pion.SettingEngine{}
 	settingEngine.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
 	settingEngine.SetNetworkTypes([]pion.NetworkType{
+		pion.NetworkTypeUDP4,
+		pion.NetworkTypeUDP6,
 		pion.NetworkTypeTCP4,
 		pion.NetworkTypeTCP6,
 	})
