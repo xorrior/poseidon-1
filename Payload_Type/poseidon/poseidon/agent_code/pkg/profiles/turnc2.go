@@ -20,6 +20,7 @@ import (
 
 	"github.com/andybalholm/brotli"
 	"github.com/pion/ice/v2"
+	pionlog "github.com/pion/logging"
 	pion "github.com/pion/webrtc/v3"
 
 	"github.com/MythicAgents/poseidon/Payload_Type/poseidon/agent_code/pkg/responses"
@@ -27,6 +28,28 @@ import (
 	"github.com/MythicAgents/poseidon/Payload_Type/poseidon/agent_code/pkg/utils/crypto"
 	"github.com/MythicAgents/poseidon/Payload_Type/poseidon/agent_code/pkg/utils/structs"
 )
+
+// debugLoggerFactory routes pion's internal logs through utils.PrintDebug
+type debugLoggerFactory struct{}
+
+func (f *debugLoggerFactory) NewLogger(scope string) pionlog.LeveledLogger {
+	return &debugLogger{scope: scope}
+}
+
+type debugLogger struct {
+	scope string
+}
+
+func (l *debugLogger) Trace(msg string)                          { utils.PrintDebug(fmt.Sprintf("[pion:%s] TRACE %s\n", l.scope, msg)) }
+func (l *debugLogger) Tracef(format string, args ...interface{}) { utils.PrintDebug(fmt.Sprintf("[pion:%s] TRACE %s\n", l.scope, fmt.Sprintf(format, args...))) }
+func (l *debugLogger) Debug(msg string)                          { utils.PrintDebug(fmt.Sprintf("[pion:%s] DEBUG %s\n", l.scope, msg)) }
+func (l *debugLogger) Debugf(format string, args ...interface{}) { utils.PrintDebug(fmt.Sprintf("[pion:%s] DEBUG %s\n", l.scope, fmt.Sprintf(format, args...))) }
+func (l *debugLogger) Info(msg string)                           { utils.PrintDebug(fmt.Sprintf("[pion:%s] INFO %s\n", l.scope, msg)) }
+func (l *debugLogger) Infof(format string, args ...interface{})  { utils.PrintDebug(fmt.Sprintf("[pion:%s] INFO %s\n", l.scope, fmt.Sprintf(format, args...))) }
+func (l *debugLogger) Warn(msg string)                           { utils.PrintDebug(fmt.Sprintf("[pion:%s] WARN %s\n", l.scope, msg)) }
+func (l *debugLogger) Warnf(format string, args ...interface{})  { utils.PrintDebug(fmt.Sprintf("[pion:%s] WARN %s\n", l.scope, fmt.Sprintf(format, args...))) }
+func (l *debugLogger) Error(msg string)                          { utils.PrintDebug(fmt.Sprintf("[pion:%s] ERROR %s\n", l.scope, msg)) }
+func (l *debugLogger) Errorf(format string, args ...interface{}) { utils.PrintDebug(fmt.Sprintf("[pion:%s] ERROR %s\n", l.scope, fmt.Sprintf(format, args...))) }
 
 // turnc2_initial_config is set at compile time via ldflags
 var turnc2_initial_config string
@@ -418,6 +441,10 @@ func (c *C2Turnc2) establishWebRTC() error {
 		5*time.Minute,  // failed timeout
 		10*time.Second, // keepalive interval
 	)
+	settingEngine.SetRelayAcceptanceMinWait(0)
+	// Route pion's internal logs through debug output so we can see
+	// TURN allocation failures, ICE errors, etc.
+	settingEngine.LoggerFactory = &debugLoggerFactory{}
 
 	api := pion.NewAPI(pion.WithSettingEngine(settingEngine))
 
@@ -434,6 +461,15 @@ func (c *C2Turnc2) establishWebRTC() error {
 	// Reset channels for new connection
 	c.recvChannel = make(chan []byte, 100)
 	c.dataChannelReady = make(chan bool, 1)
+
+	// Log ICE candidates as they are gathered
+	pc.OnICECandidate(func(candidate *pion.ICECandidate) {
+		if candidate == nil {
+			utils.PrintDebug("[turnc2] ICE candidate gathering finished (nil sentinel)\n")
+			return
+		}
+		utils.PrintDebug(fmt.Sprintf("[turnc2] ICE candidate: %s\n", candidate.String()))
+	})
 
 	// Set up data channel handler
 	pc.OnDataChannel(func(dc *pion.DataChannel) {
