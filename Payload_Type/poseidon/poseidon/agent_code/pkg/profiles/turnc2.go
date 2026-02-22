@@ -517,14 +517,21 @@ func (c *C2Turnc2) establishWebRTC() error {
 		})
 	})
 
-	// Monitor connection state
+	// Monitor connection state — close recvChannel on failure to trigger reconnect
 	pc.OnConnectionStateChange(func(state pion.PeerConnectionState) {
 		utils.PrintDebug(fmt.Sprintf("WebRTC connection state: %s\n", state.String()))
 		switch state {
-		case pion.PeerConnectionStateDisconnected, pion.PeerConnectionStateFailed, pion.PeerConnectionStateClosed:
+		case pion.PeerConnectionStateFailed, pion.PeerConnectionStateClosed:
 			if !c.ShouldStop {
-				utils.PrintDebug(fmt.Sprintf("WebRTC connection lost, will reconnect\n"))
+				utils.PrintDebug(fmt.Sprintf("WebRTC connection lost (%s), closing recvChannel to trigger reconnect\n", state.String()))
+				c.recvBufMu.Lock()
+				ch := c.recvChannel
+				c.recvChannel = make(chan []byte, 100)
+				c.recvBufMu.Unlock()
+				close(ch)
 			}
+		case pion.PeerConnectionStateDisconnected:
+			utils.PrintDebug(fmt.Sprintf("WebRTC connection disconnected, waiting for recovery\n"))
 		}
 	})
 
@@ -650,6 +657,17 @@ func (c *C2Turnc2) establishWebRTC() error {
 		})
 		newPC.OnConnectionStateChange(func(state pion.PeerConnectionState) {
 			utils.PrintDebug(fmt.Sprintf("reconnect WebRTC state: %s\n", state.String()))
+			switch state {
+			case pion.PeerConnectionStateFailed, pion.PeerConnectionStateClosed:
+				if !c.ShouldStop {
+					utils.PrintDebug(fmt.Sprintf("reconnect: WebRTC connection lost (%s), closing recvChannel\n", state.String()))
+					c.recvBufMu.Lock()
+					ch := c.recvChannel
+					c.recvChannel = make(chan []byte, 100)
+					c.recvBufMu.Unlock()
+					close(ch)
+				}
+			}
 		})
 
 		// Set the synthetic server offer as remote description
@@ -980,7 +998,11 @@ func (c *C2Turnc2) handleChunkedRecv(chunk []byte) {
 		msg := c.recvBuf[:c.recvExpected]
 		c.recvBuf = nil
 		c.recvExpected = 0
-		c.recvChannel <- msg
+		ch := c.recvChannel
+		// Release lock before blocking send to avoid deadlock with state change handler
+		c.recvBufMu.Unlock()
+		ch <- msg
+		c.recvBufMu.Lock()
 	}
 }
 
